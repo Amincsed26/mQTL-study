@@ -1,5 +1,7 @@
 # Metabolic QTLs and Metabolic Networks Project
 
+![Project Flow](https://github.com/user-attachments/assets/e33d8e4a-c6e5-43c6-9f87-83e7802cf40b)
+
 ## Project Overview
 
 This project aims to analyze genomic and metabolomic data from a cohort of 156 Qatari individuals to uncover genetic influences on metabolite levels and understand the metabolic network structure. By integrating genotype and metabolite data, we perform a comprehensive genomic analysis to identify metabolic quantitative trait loci (mQTLs) and construct metabolic networks.
