@@ -1,0 +1,583 @@
+---
+title: "Project: Metabolic QTLs and Metabolic Networks"
+author: "Rafy Hany , Amin Mohamed"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+## Objective
+
+This project aims to perform genomic analysis, including kinship calculation, SNP-metabolite association discovery (mQTL), visualization, metabolic network construction, network visualization, genetic variant annotation, regional plots, and inflation factor calculation.
+
+### Data
+
+The data used in this project includes: - Genomic data (SNPs) - Metabolomic data (metabolites) - Phenotypic data (traits) - Kinship matrix - Genetic variant annotation data
+
+### Task1 : Compute Kinship using SNPRelate and GENESIS
+
+-   **Load required libraries**
+
+```{r , message=FALSE, warning=FALSE }
+if(!require("BiocManager")) install.packages("BiocManager")
+if(!require("SNPRelate")) BiocManager::install("SNPRelate")
+if(!require("GENESIS")) BiocManager::install("GENESIS")
+if(!require("gdsfmt")) BiocManager::install("gdsfmt")
+if(!require("ggplot2")) install.packages("ggplot2")
+if(!require("dplyr")) install.packages("dplyr")
+if(!require("tidyverse")) install.packages("tidyverse")
+if(!require("ggnetwork")) install.packages("ggnetwork")
+if(!require("ggrepel")) install.packages("ggrepel")
+if(!require("Biobase")) BiocManager::install("Biobase")
+if(!require("GWASTools")) BiocManager::install("GWASTools")
+if(!require("openxlsx")) install.packages("openxlsx")
+if(!require("qqman")) install.packages("qqman")
+if(!require("GeneNet")) BiocManager::install("GeneNet")
+if(!require("RCy3")) BiocManager::install("RCy3")
+
+library(Biobase)
+library(SNPRelate)
+library(GENESIS) 
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(ggnetwork)
+library(ggrepel)
+library(GWASTools)
+library(openxlsx)
+library(qqman)
+library(GeneNet)
+library(RCy3)
+```
+
+-   **convert to ped map format using plink**
+
+```{bash , eval=FALSE}
+plink --bfile Qatari156_filtered_pruned --recode --out qatari 
+```
+
+![](./images/ped_map.png)
+
+-   **apply pca using plink**
+
+```{bash , eval=FALSE}
+plink --file qatari --pca --out qatari
+```
+
+![](./images/pca.png)
+
+-   **convert to GDS(Genomic Data Structures) format**
+
+```{r}
+snpgdsPED2GDS(
+  ped.fn = "./mmc2/qatari.ped",
+  map.fn = "./mmc2/qatari.map",
+  out.gdsfn = "./mmc2/qatari.gds",
+)
+```
+
+![](./images/GDS.png)
+
+-   **Load the GDS file**
+
+```{r}
+gds <- snpgdsOpen("./mmc2/qatari.gds")
+gds$root
+
+```
+
+IBS (idenity by state): They have the same name (looks the same) — but maybe it’s just a coincidence. IBD (idenity by Descent): They are identical by descent (IBD) — they are identical because they inherited the same allele from a common ancestor. This is what we want to calculate. 
+
+ 
+Comparison of Kinship Estimation Methods: MLE vs KING
+
+| Feature | `snpgdsIBDMLE()` (MLE) | `snpgdsIBDKING()` (KING) |
+|------------------|---------------------------|---------------------------|
+| **Approach** | Maximum Likelihood Estimation (parametric) | Method-of-Moments (non-parametric) |
+| **Requires allele frequencies** | Yes| No |
+| **Estimates** | k0, k1, k2, and kinship | Kinship only |
+| **Kinship range** | 0 to 0.5 | -0.25 to 0.5 |
+| **Accuracy** |ore accurate (especially for relatives) | Approximate, but good for population data |
+| **Speed** | slower (computationally intensive) | fast and scalable |
+| **Handles population structure** |sensitive | robust |
+| **Best for** | Family studies, fine-scale kinship | Population-scale datasets, QC, cryptic relatedness |
+| **Returns IBD probabilities (k0/k1/k2)** | Yes NO | 
+| **Supported in GENESIS** | Yes| Yes|
+
+-   **Compute kinship using SNPRelate and GENESIS using MLE**
+
+```{r}
+kinship_MLE <- snpgdsIBDMLE(gds,
+                            sample.id = NULL, 
+                            snp.id = NULL,
+                            num.thread = 8 , 
+                            kinship = TRUE, 
+                            kinship.constraint = TRUE,
+                            verbose = TRUE)
+head(kinship_MLE$kinship)
+kinship.matrix <- kinship_MLE$kinship
+number_individual <- (sum(kinship.matrix > 0.1) - 156 ) / 2
+cat("Number of individuals with kinship > 0.1: ", number_individual, "pairs\n")
+
+unique_kinship <- 0
+for(i in 1:156) {
+  for(j in  1 : 156){
+    if(kinship.matrix[i,j] > 0.1 & i != j){
+      unique_kinship <- unique_kinship + 1
+      break
+    }    
+  }
+}
+cat("Number of unique individuals with kinship > 0.1: ", unique_kinship, "individuals\n")
+
+
+```
+
+### Task 2: Compute mQTLs with Mixed Models
+
+-   **Load the metabolomic data**
+
+```{r}
+metabolites <- read.csv("qatari_metabolites_2025.csv" , header = TRUE)
+rownames(kinship.matrix) <- metabolites[, 1]
+colnames(kinship.matrix) <- metabolites[, 1]
+```
+
+-   **Load the eigen Vectors**
+
+```{r}
+
+eigen.vec <- read.table("./mmc2/qatari.eigenvec", header = FALSE)
+eigen.vec <- eigen.vec[,-1]
+colnames(eigen.vec) <- c("IID", paste0("PC", 1:(ncol(eigen.vec) - 2)))
+
+```
+
+-   **compute residuals of metabolites and association with SNPs**
+
+```{r}
+pcs <- eigen.vec[,c(2:4)]
+colnames(pcs) <- c("PC1", "PC2", "PC3")
+all.data <- as.data.frame(cbind(pcs , metabolites[,-1]))
+rownames(all.data) <- metabolites$Sample
+meta.names <- colnames(metabolites)[-1]
+
+scan_annot_df <- data.frame(
+  scanID = metabolites$Sample,
+  stringsAsFactors = FALSE
+)
+rownames(scan_annot_df) <- scan_annot_df$scanID
+snpgdsClose(gds)
+gds <- GdsGenotypeReader("./mmc2/qatari.gds")
+snp_df <- getSnpID(gds)
+snp_pos <- getPosition(gds)
+snp_chr <- getChromosome(gds)
+alleleA <- getAlleleA(gds)
+alleleB <- getAlleleB(gds)
+
+snp_annot_df <- data.frame(
+  snpID = snp_df,
+  chromosome = snp_chr,
+  position = snp_pos,
+  alleleA = alleleA,
+  alleleB = alleleB,
+  stringsAsFactors = FALSE
+)
+
+
+scan_annot <- ScanAnnotationDataFrame(scan_annot_df)
+snp_annot <- SnpAnnotationDataFrame(snp_annot_df)
+genoData <- GenotypeData(gds, scanAnnot = scan_annot, snpAnnot = snp_annot)
+results <- list()
+models <- list()
+for (meta in meta.names) {
+   null.model<- fitNullModel(
+        x = all.data,
+        outcome = meta,
+        covars = c("PC1", "PC2", "PC3"),
+        cov.mat = kinship.matrix,
+        verbose = TRUE        
+    )
+   
+   genoIterator <- GenotypeBlockIterator(genoData) 
+
+    assoc <- assocTestSingle(
+                gdsobj = genoIterator,
+                null.model = null.model,
+                verbose=TRUE)
+    assoc$metabolite <- meta  
+    results[[meta]] <- assoc
+    models[[meta]] <- null.model
+    
+}
+
+head(results$Metabolite1)
+
+dim(results$Metabolite1)
+
+snp_annot_extracted <- getSnpAnnotation(genoData)
+variant.annot <- pData(snp_annot_extracted)
+```
+
+-   **Report significant SNP-Metabolite associations**
+
+```{r}
+
+combined.results <- bind_rows(results)  
+signif_results <- filter(combined.results, Score.pval < 0.0001)
+dim(signif_results)
+```
+
+-   **Export significant results to Excel**
+
+```{r}
+
+signif_results <- merge(signif_results, variant.annot, by.x = "variant.id", by.y = "snpID")
+
+signif_results$effect.allele  <- signif_results$alleleA
+signif_results <- signif_results[,-c((length(signif_results) - 5):(length(signif_results) - 1))]
+signif_results$df <- signif_results$n.obs - 4 
+write.xlsx(signif_results, file = "./significant_mQTLs.xlsx", rowNames = FALSE)
+```
+
+-   **heritability**
+
+```{r}
+heritability <- list()
+for (meta in meta.names){
+    heritability[[meta]] <- varCompCI(models[[meta]])
+    
+}
+
+heritability_results <- data_frame(
+  metabolites = meta.names,
+  heritability = NA,
+)  
+for(meta in meta.names){
+  h2 <- heritability[[meta]]$Proportion[1] / (heritability[[meta]]$Proportion[1] + heritability[[meta]]$Proportion[2] )
+  heritability_results[meta.names == meta, "heritability"] <- h2
+}
+#print(heritability_results)
+```
+
+-   **write to excel file**
+
+```{r}
+write.xlsx(heritability_results, file = "./heritability.xlsx", rowNames = FALSE)
+```
+
+### Task 3: Inflation factor calculation
+
+-   **Calculate inflation factor**
+
+```{r}
+inflation.factors <- data.frame(
+  metabolite = meta.names,
+  lambda = NaN
+)
+
+for (meta in meta.names) {
+  assoc <- results[[meta]]  
+  chi2 <- (assoc$Score.Stat)^2
+  lambda <- median(chi2, na.rm = TRUE) / 0.455
+  inflation.factors[meta.names == meta , "lambda"] <- lambda
+}
+print(inflation.factors)
+
+avg_inflation <- mean(inflation.factors$lambda, na.rm = TRUE)
+inflation.factors <- bind_rows(inflation.factors, data.frame(metabolite = "Average", lambda = avg_inflation))
+
+cat("Average inflation factors = ",avg_inflation)
+```
+
+-   **write the results to excel sheet**
+
+```{r}
+write.xlsx(inflation.factors, file = "./inflationFactors.xlsx", rowNames = FALSE)
+```
+
+### Task 4: Manhattan Plots
+
+-   **Plot a Manhattan plot for ALL associations (significant or not)** .
+
+```{r}
+manhattan.data <- combined.results
+
+unique_chr <- unique(combined.results$chr)
+print(unique_chr)
+```
+
+-   **Plot a Manhattan plot for all metabolite**
+
+```{r, warning = FALSE}
+
+manhattan.data$CHR <- as.character(manhattan.data$chr)
+manhattan.data$CHR[manhattan.data$CHR == "X"] <- "23"
+manhattan.data$CHR <- as.numeric(manhattan.data$CHR)
+
+manhattan.data$BP <- manhattan.data$pos
+manhattan.data$P <- manhattan.data$Score.pval
+manhattan.data$SNP <- manhattan.data$variant.id 
+
+# plotting association of the whole mQTL results
+manhattan(
+  manhattan.data,
+  col = c("darkblue", "darkorange"),
+  genomewideline = -log10(1e-4),
+  suggestiveline = FALSE,
+  main = "Manhattan Plot of all mQTL Results"
+)
+```
+
+-   **Plot a Manhattan plot for each metabolite separately.**
+
+```{r}
+
+unique_mets <- unique(combined.results$metabolite)
+for (meta in unique_mets) {
+  df <- combined.results[combined.results$metabolite == meta, ]
+  df$CHR <- as.character(df$chr)
+  df$CHR[df$CHR == "X"] <- "23"
+  df$CHR <- as.numeric(df$CHR)
+  
+  df$BP <- df$pos
+  df$P <- df$Score.pval
+  df$SNP <- df$variant.id
+  manhattan(
+    df,
+    col = c("darkblue", "darkorange"),
+    genomewideline = -log10(1e-4),
+    suggestiveline = FALSE,
+    main = paste("Manhattan Plot for", meta)
+  )
+}
+
+```
+
+### Task 5: Metabolic Networks
+
+-   **Calculate partial correlation**
+
+```{r, warning=FALSE}
+
+fitted.values.matrix <- matrix(nrow = nrow(all.data), ncol = length(meta.names))
+rownames(fitted.values.matrix) <- rownames(all.data)
+colnames(fitted.values.matrix) <- meta.names
+
+for (meta in meta.names) {
+  fitted.values.matrix[, meta] <- models[[meta]]$fit$fitted.values
+}
+
+pcor.matrix <- ggm.estimate.pcor(fitted.values.matrix)
+pcor.test <- network.test.edges(pcor.matrix)
+dim(pcor.test)
+significant.edges <- pcor.test[pcor.test$pval < 0.05, ]
+write.csv(significant.edges, "significant_partial_correlation_residuals.csv", row.names = FALSE)
+head(significant.edges)
+
+```
+
+-   **Use Cytoscape to draw the metabolic networks. Add names to nodes.**
+
+```{r}
+cytoscapePing()
+significant_pairs <- read.csv("significant_partial_correlation_residuals.csv", stringsAsFactors = FALSE)
+edges <- data.frame(
+  source = paste0("meta",significant_pairs$node1),
+  target = paste0("meta",significant_pairs$node2),
+  weight = significant_pairs$pcor,
+  interaction = "interacts with",  
+  pval = significant_pairs$pval,
+  qval = significant_pairs$qval
+)
+
+nodes <- data.frame(
+  id = unique(c(edges$source, edges$target)),
+  name = unique(c(edges$source, edges$target)),
+  stringsAsFactors = FALSE
+)
+
+
+createNetworkFromDataFrames(
+  nodes = nodes,
+  edges = edges,
+  title = "Metabolic Network",
+  collection = "Metabolite Correlations"
+)
+
+
+
+layoutNetwork("force-directed")
+
+
+setNodeShapeDefault("ELLIPSE")  
+setNodeSizeDefault(30)           
+setNodeLabelMapping("name")
+
+setEdgeLineWidthMapping(
+  table.column = "weight",
+  table.column.values = seq(min(abs(edges$weight)), max(abs(edges$weight)), length.out = 5),
+  widths = seq(1, 3, length.out = 5),
+  mapping.type = "continuous"
+)
+
+setEdgeColorMapping(
+  table.column = "weight",
+  table.column.values = c(min(edges$weight), 0, max(edges$weight)),
+  colors = c("#d60a0a", "#b7b9bb", "#24960d"),
+  mapping.type = "continuous"
+)
+```
+
+![](./images/cyto1.png)
+
+```{r}
+analyzeNetwork()
+node.table <- getTableColumns(table = "node")
+write.csv(node.table, "metabolite_network_node_metrics.csv", row.names = FALSE)
+saveSession("Metabolite_Network_Analysis.cys")
+print(head(node.table[, c("name", "Degree", "ClosenessCentrality", "BetweennessCentrality")]))
+```
+
+### Task 6: Annotate Significant SNPs
+
+-   **Load the top 20 significant SNPs**
+
+```{r}
+sig_top_20 <- signif_results[ order(signif_results$Score.pval) , ]
+sig_top_20 <- sig_top_20[!duplicated(sig_top_20$variant.id), ]
+sig_top_20[sig_top_20$chr == "X","chr"] <- 23
+sig_top_20 <- sig_top_20[1:20, ]
+dim(sig_top_20)
+```
+
+-   **Load the annotation data from ped and map**
+
+```{r}
+ped_file <- read.table("./mmc2/qatari.ped", header = FALSE , stringsAsFactors = FALSE)
+map_file <- read.table("./mmc2/qatari.map", header = FALSE, stringsAsFactors = FALSE)
+colnames(map_file) <- c("chr", "snp_id", "genetic_dist", "position")
+indecies <-  which(map_file$position %in% sig_top_20$pos & map_file$chr %in% sig_top_20$chr)
+map_top_20 <- map_file[indecies , ]
+dim(map_top_20)
+ped_cols <- sort(unlist(lapply(indecies, function(i) c(6 + 2*i - 1, 6 + 2*i))))
+ped_top_20 <- ped_file[,c(1:6 , ped_cols)]
+dim(ped_top_20)
+
+write.table(ped_top_20, file = "./mmc2/qatari_top_20.ped", sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+write.table(map_top_20, file = "./mmc2/qatari_top_20.map", sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+```
+
+-   **Convert to VCF format**
+
+```{bash , eval=FALSE}
+plink --file qatari_top_20 --recode vcf --out qatari_top_20
+```
+
+-   **Annotate VCF with ANNOVAR**
+
+```{bash , eval=FALSE}
+./table_annovar.pl qatari_top_20.vcf humandb/ \
+  -buildver hg19 \
+  -out annotated_output \
+  -remove \
+  -protocol refGene \
+  -operation g \
+  -nastring . \
+  -vcfinput \
+  -polish \
+  -thread 4
+
+```
+
+| Flag | Description |
+|-----------------------------------------------|-------------------------|
+| `./table_annovar.pl` | The Perl script provided by ANNOVAR for annotation. |
+| `qatari_top_20.vcf` | Input file in **VCF format** containing the top 20 SNPs. |
+| `humandb/` | Directory containing the **ANNOVAR databases** (e.g., refGene). |
+| `-buildver hg19` | Specifies the genome build version (e.g., `hg19` or `hg38`). |
+| `-out annotated_output` | Output prefix for the result files . |
+| `-remove` | Delete intermediate files after annotation to save space. |
+| `-protocol refGene` | Use the `refGene` database for gene-based annotation. |
+| `-operation g` | Type of operation to apply: `g` stands for **gene-based** annotation. |
+| `-nastring .` | Use a dot `.` for missing values in the output file. |
+| `-vcfinput` | Indicates that the input file is in **VCF** format. |
+| `-polish` | Clean up/refine annotations (e.g., remove duplicates, standardize formats). |
+| `-thread 4` | Use 4 CPU threads to speed up processing (parallel execution). |
+
+| **Value** | **Meaning** |
+|-------------------------|-----------------------------------------------|
+| `exonic` | Variant is located within an **exon** (coding sequence) of a gene. |
+| `splicing` | Variant is located near a **splice site**, potentially affecting splicing. |
+| `exonic;splicing` | Variant is both **exonic** and near a splice junction. |
+| `intronic` | Variant is located within an **intron**, a non-coding region inside a gene. |
+| `UTR5` | Located in the **5  untranslated region** of a transcript. |
+| `UTR3` | Located in the **3  untranslated region** of a transcript. |
+| `intergenic` | Located **between genes**, not associated with any specific gene. |
+| `ncRNA_exonic` | Located in the **exon** of a non-coding RNA gene. |
+| `ncRNA_intronic` | Located in the **intron** of a non-coding RNA gene. |
+| `ncRNA_splicing` | Located near a **splice site** of a non-coding RNA gene. |
+
+| **Value** | **Meaning** |
+|-------------------------|-----------------------------------------------|
+| `synonymous_SNV` | A **silent** mutation – amino acid doesn't change. |
+| `nonsynonymous_SNV` | A **missense** mutation – changes the amino acid. |
+| `stopgain` | Introduces a **premature stop codon** (truncates the protein). |
+| `stoploss` | Removes a stop codon – protein may be longer. |
+| `frameshift_insertion` | Insertion that disrupts the reading frame  big effect. |
+| `frameshift_deletion` | Deletion that disrupts the reading frame. |
+| `nonframeshift_insertion` | Insertion that doesn't shift the frame (3, 6, 9 bases etc.). |
+| `nonframeshift_deletion` | Deletion that doesn’t affect the frame. |
+| `unknown` | A variant was found, but ANNOVAR couldn’t classify it. |
+
+### Task 7: SNIPA
+
+-   **get the top 5 significant snps**
+
+```{r}
+
+top_5_snps <- signif_results[order(signif_results$Score.pval), ][1:5, ]
+rs_snps_name <- map_top_20[map_top_20$position %in% top_5_snps$pos, ]
+print(rs_snps_name$snp_id)
+
+```
+
+-   **proxy SNIPA**
+
+![](./images/1.jpeg)
+
+![](./images/2.jpeg)
+
+![](./images/3.jpeg)
+
+![](./images/4.jpeg)
+
+-   **proxy Annotaion**
+    -   for snp1 : ![](./images/1_1.jpeg) ![](./images/1_2.jpeg)
+
+    -   for snp2 : ![](./images/2_1.jpeg) ![](./images/2_2.jpeg)
+
+    -   for snp3 : ![](./images/3_.jpeg)
+
+    -   for snp4 : ![](./images/4_.jpeg)
+
+    -   for snp5 : ![](./images/5_1.jpeg) ![](./images/5_2.jpeg)
+-   **regional plots** ![](./images/5.jpeg)
+
+![](./images/6.jpeg)
+
+![](./images/7.jpeg)
+
+![](./images/8.jpeg)
+
+![](./images/9.jpeg)
+
+-   **LD plots** ![](./images/10.jpeg)
+
+![](./images/11.jpeg)
+
+![](./images/12.jpeg)
+
+![](./images/13.jpeg)
+
+![](./images/14.jpeg)
